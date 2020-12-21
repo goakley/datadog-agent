@@ -28,7 +28,7 @@ func bindataTracerO() (*asset, error) {
 		name:        "tracer.o",
 		size:        66008,
 		md5checksum: "",
-		mode:        os.FileMode(420),
+		mode:        os.FileMode(436),
 		modTime:     time.Unix(1, 0),
 	}
 
