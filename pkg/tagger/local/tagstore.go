@@ -1,17 +1,23 @@
-package tagger
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-2020 Datadog, Inc.
+
+package local
 
 import (
+	"errors"
 	"fmt"
-	"hash/fnv"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/DataDog/datadog-agent/pkg/tagger/collectors"
+	"github.com/DataDog/datadog-agent/pkg/tagger/types"
 	"github.com/DataDog/datadog-agent/pkg/util/containers"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
+
+var errNotFound = errors.New("entity not found")
 
 // entityTags holds the tag information for a given entity
 type entityTags struct {
@@ -23,7 +29,6 @@ type entityTags struct {
 	cachedAll          []string // Low + orchestrator + high
 	cachedOrchestrator []string // Low + orchestrator (subslice of cachedAll)
 	cachedLow          []string // Sub-slice of cachedAll
-	tagsHash           string
 	toDelete           map[string]struct{}
 }
 
@@ -45,7 +50,7 @@ type sourceTags struct {
 }
 
 type entityEvent struct {
-	eventType  EventType
+	eventType  types.EventType
 	storedTags *entityTags
 }
 
@@ -58,14 +63,14 @@ type tagStore struct {
 	toDelete map[string]struct{} // set emulation
 
 	subscribersMutex sync.RWMutex
-	subscribers      map[chan []EntityEvent]collectors.TagCardinality
+	subscribers      map[chan []types.EntityEvent]collectors.TagCardinality
 }
 
 func newTagStore() *tagStore {
 	return &tagStore{
 		store:       make(map[string]*entityTags),
 		toDelete:    make(map[string]struct{}),
-		subscribers: make(map[chan []EntityEvent]collectors.TagCardinality),
+		subscribers: make(map[chan []types.EntityEvent]collectors.TagCardinality),
 	}
 }
 
@@ -103,9 +108,9 @@ func (s *tagStore) processTagInfo(tagInfos []*collectors.TagInfo) {
 			continue
 		}
 
-		eventType := EventTypeModified
+		eventType := types.EventTypeModified
 		if !exist {
-			eventType = EventTypeAdded
+			eventType = types.EventTypeAdded
 			storedTags = newEntityTags(info.Entity)
 			s.store[info.Entity] = storedTags
 		}
@@ -155,39 +160,9 @@ func updateStoredTags(storedTags *entityTags, info *collectors.TagInfo) error {
 	return nil
 }
 
-// Entity is an entity ID + tags.
-type Entity struct {
-	ID                          string
-	Hash                        string
-	HighCardinalityTags         []string
-	OrchestratorCardinalityTags []string
-	LowCardinalityTags          []string
-	StandardTags                []string
-}
-
-// EventType is a type of event, triggered when an entity is added, modified or
-// deleted.
-type EventType int
-
-const (
-	// EventTypeAdded means an entity was added.
-	EventTypeAdded EventType = iota
-	// EventTypeModified means an entity was modified.
-	EventTypeModified
-	// EventTypeDeleted means an entity was deleted.
-	EventTypeDeleted
-)
-
-// EntityEvent is an event generated when an entity is added, modified or
-// deleted. It contains the event type and the new entity.
-type EntityEvent struct {
-	EventType EventType
-	Entity    Entity
-}
-
 // subscribe returns a channel that receives a slice of events whenever an entity is
 // added, modified or deleted.
-func (s *tagStore) subscribe(cardinality collectors.TagCardinality) chan []EntityEvent {
+func (s *tagStore) subscribe(cardinality collectors.TagCardinality) chan []types.EntityEvent {
 	// this buffer size is an educated guess, as we know the rate of
 	// updates, but not how fast these can be streamed out yet. it most
 	// likely should be configurable.
@@ -197,14 +172,14 @@ func (s *tagStore) subscribe(cardinality collectors.TagCardinality) chan []Entit
 	// improve throughput, as bursts of events are as likely to occur as
 	// isolated events, especially at startup or with the kubelet
 	// collector, since it's a collector that periodically pulls changes.
-	ch := make(chan []EntityEvent, bufferSize)
+	ch := make(chan []types.EntityEvent, bufferSize)
 
 	s.RLock()
 	defer s.RUnlock()
-	events := make([]EntityEvent, 0, len(s.store))
+	events := make([]types.EntityEvent, 0, len(s.store))
 	for _, storedTags := range s.store {
-		events = append(events, EntityEvent{
-			EventType: EventTypeAdded,
+		events = append(events, types.EntityEvent{
+			EventType: types.EventTypeAdded,
 			Entity:    storedTags.toEntity(cardinality),
 		})
 	}
@@ -219,7 +194,7 @@ func (s *tagStore) subscribe(cardinality collectors.TagCardinality) chan []Entit
 }
 
 // unsubscribe ends a subscription to entity events and closes its channel.
-func (s *tagStore) unsubscribe(ch chan []EntityEvent) {
+func (s *tagStore) unsubscribe(ch chan []types.EntityEvent) {
 	s.subscribersMutex.Lock()
 	defer s.subscribersMutex.Unlock()
 
@@ -237,18 +212,18 @@ func (s *tagStore) notifySubscribers(events []entityEvent) {
 	// notifications being sent, and at which cardinality
 
 	for ch, cardinality := range s.subscribers {
-		subscriberEvents := make([]EntityEvent, 0, len(events))
+		subscriberEvents := make([]types.EntityEvent, 0, len(events))
 
 		for _, event := range events {
-			var entity Entity
+			var entity types.Entity
 
-			if event.eventType != EventTypeDeleted {
+			if event.eventType != types.EventTypeDeleted {
 				entity = event.storedTags.toEntity(cardinality)
 			} else {
-				entity = Entity{ID: event.storedTags.entityID}
+				entity = types.Entity{ID: event.storedTags.entityID}
 			}
 
-			subscriberEvents = append(subscriberEvents, EntityEvent{
+			subscriberEvents = append(subscriberEvents, types.EntityEvent{
 				EventType: event.eventType,
 				Entity:    entity,
 			})
@@ -256,21 +231,6 @@ func (s *tagStore) notifySubscribers(events []entityEvent) {
 
 		ch <- subscriberEvents
 	}
-}
-
-func computeTagsHash(tags []string) string {
-	hash := ""
-	if len(tags) > 0 {
-		// do not sort original slice
-		tags = copyArray(tags)
-		h := fnv.New64()
-		sort.Strings(tags)
-		for _, i := range tags {
-			h.Write([]byte(i)) //nolint:errcheck
-		}
-		hash = strconv.FormatUint(h.Sum64(), 16)
-	}
-	return hash
 }
 
 // prune will lock the store and delete tags for the entity previously
@@ -307,14 +267,14 @@ func (s *tagStore) prune() error {
 		if len(storedTags.sourceTags) == 0 {
 			delete(s.store, entity)
 			events = append(events, entityEvent{
-				eventType:  EventTypeDeleted,
+				eventType:  types.EventTypeDeleted,
 				storedTags: storedTags,
 			})
 		} else {
 			storedTags.cacheValid = false
 			storedTags.toDelete = make(map[string]struct{})
 			events = append(events, entityEvent{
-				eventType:  EventTypeModified,
+				eventType:  types.EventTypeModified,
 				storedTags: storedTags,
 			})
 		}
@@ -334,15 +294,14 @@ func (s *tagStore) prune() error {
 
 // lookup gets tags from the store and returns them concatenated in a string
 // slice. It returns the source names in the second slice to allow the
-// client to trigger manual lookups on missing sources, the last string
-// is the tags hash to have a snapshot digest of all the tags.
-func (s *tagStore) lookup(entity string, cardinality collectors.TagCardinality) ([]string, []string, string) {
+// client to trigger manual lookups on missing sources.
+func (s *tagStore) lookup(entity string, cardinality collectors.TagCardinality) ([]string, []string) {
 	s.RLock()
 	defer s.RUnlock()
 	storedTags, present := s.store[entity]
 
 	if present == false {
-		return nil, nil, ""
+		return nil, nil
 	}
 	return storedTags.get(cardinality)
 }
@@ -351,10 +310,12 @@ func (s *tagStore) lookup(entity string, cardinality collectors.TagCardinality) 
 func (s *tagStore) lookupStandard(entity string) ([]string, error) {
 	s.RLock()
 	defer s.RUnlock()
+
 	storedTags, present := s.store[entity]
 	if present == false {
-		return nil, fmt.Errorf("entity %s not found", entity)
+		return nil, errNotFound
 	}
+
 	return storedTags.getStandard(), nil
 }
 
@@ -374,21 +335,21 @@ type tagPriority struct {
 	cardinality collectors.TagCardinality    // cardinality level of the tag (low, orchestrator, high)
 }
 
-func (e *entityTags) get(cardinality collectors.TagCardinality) ([]string, []string, string) {
+func (e *entityTags) get(cardinality collectors.TagCardinality) ([]string, []string) {
 	e.computeCache()
 
 	e.Lock()
 	defer e.Unlock()
 
 	if cardinality == collectors.HighCardinality {
-		return e.cachedAll, e.cachedSource, e.tagsHash
+		return e.cachedAll, e.cachedSource
 	} else if cardinality == collectors.OrchestratorCardinality {
-		return e.cachedOrchestrator, e.cachedSource, e.tagsHash
+		return e.cachedOrchestrator, e.cachedSource
 	}
-	return e.cachedLow, e.cachedSource, e.tagsHash
+	return e.cachedLow, e.cachedSource
 }
 
-func (e *entityTags) toEntity(cardinality collectors.TagCardinality) Entity {
+func (e *entityTags) toEntity(cardinality collectors.TagCardinality) types.Entity {
 	e.computeCache()
 
 	standardTags := e.getStandard()
@@ -396,9 +357,10 @@ func (e *entityTags) toEntity(cardinality collectors.TagCardinality) Entity {
 	e.RLock()
 	defer e.RUnlock()
 
-	entity := Entity{
-		ID:           e.entityID,
-		Hash:         e.tagsHash,
+	entity := types.Entity{
+		ID: e.entityID,
+		// TODO(juliogreff): FIXME
+		// Hash:         e.tagsHash,
 		StandardTags: standardTags,
 	}
 
@@ -470,7 +432,6 @@ func (e *entityTags) computeCache() {
 	e.cachedAll = tags
 	e.cachedLow = e.cachedAll[:len(lowCardTags)]
 	e.cachedOrchestrator = e.cachedAll[:len(lowCardTags)+len(orchestratorCardTags)]
-	e.tagsHash = computeTagsHash(e.cachedAll)
 }
 
 func insertWithPriority(tagPrioMapper map[string][]tagPriority, tags []string, source string, cardinality collectors.TagCardinality) {
